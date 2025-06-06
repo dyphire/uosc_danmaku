@@ -580,14 +580,14 @@ end
 
 -- 通过文件前 16M 的 hash 值进行弹幕匹配
 function get_danmaku_with_hash(file_name, file_path)
-    if is_protocol(file_path) then
+    local temp_file = "temp-" .. pid .. ".mp4"
+    local cache_state = mp.get_property_native("demuxer-cache-state")
+    local cache_bytes = cache_state and cache_state["fw-bytes"] or 0
+    local cache_ranges = cache_state and cache_state["seekable-ranges"] or {}
+    local cache_start = cache_ranges[1] and cache_ranges[1]["start"] or nil
+    local cache_end = cache_ranges[1] and cache_ranges[1]["end"] or nil
+    if is_protocol(file_path) or #cache_ranges > 0 then
         set_danmaku_button()
-        local temp_file = "temp-" .. pid .. ".mp4"
-        local cache_state = mp.get_property_native("demuxer-cache-state")
-        local cache_bytes = cache_state and cache_state["fw-bytes"] or 0
-        local cache_ranges = cache_state and cache_state["seekable-ranges"] or {}
-        local cache_start = cache_ranges[1] and cache_ranges[1]["start"] or nil
-        local cache_end = cache_ranges[1] and cache_ranges[1]["end"] or nil
         if cache_start and tonumber(cache_start) == 0 and tonumber(cache_bytes) >= 16 * 1024 * 1024 then
             local file_path = utils.join_path(danmaku_path, temp_file)
             mp.commandv("dump-cache", cache_start, cache_end, file_path)
@@ -601,8 +601,17 @@ function get_danmaku_with_hash(file_name, file_path)
             return
         end
 
+        if not is_protocol(file_path) then
+            match_anime()
+            return
+        end
+
         local arg = {
             "curl",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
             "--range",
             "0-16777215",
             "--user-agent",
