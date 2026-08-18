@@ -680,8 +680,10 @@ function convert_danmaku_to_ass_events(force)
     local res_x = 1920
     local res_y = 1080
 
-    local roll_array = DanmakuArray:new(res_x, res_y, fontsize)
-    local top_array = DanmakuArray:new(res_x, res_y, fontsize)
+    local displayarea = math.max(0.01, math.min(1, tonumber(options.displayarea) or 1))
+    local layout_res_y = math.max(fontsize, math.floor(res_y * displayarea + fontsize + 0.5))
+    local roll_array = DanmakuArray:new(res_x, layout_res_y, fontsize)
+    local top_array = DanmakuArray:new(res_x, layout_res_y, fontsize)
 
     -- 预处理弹幕，先计算时间段以便进行数量限制
     local pre_events = {}
