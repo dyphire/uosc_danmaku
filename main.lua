@@ -9,7 +9,6 @@ AES = require("modules/aes")
 Base64 = require("modules/base64")
 MD5 = require("modules/md5")
 Sha256 = require("modules/hash")
-
 require("modules/options")
 require("modules/utils")
 require("modules/parse")
@@ -70,6 +69,19 @@ PLATFORM = (function()
 end)()
 
 local rebuild_convert_timer = nil
+local auto_load_generation = 0
+
+local function delay_auto_load(callback)
+    local delay = tonumber(options.auto_load_delay) or 0
+    local generation = auto_load_generation
+    if delay <= 0 then
+        callback()
+        return
+    end
+    mp.add_timeout(delay, function()
+        if generation == auto_load_generation then callback() end
+    end)
+end
 
 function get_danmaku_visibility()
     local history_json = read_file(HISTORY_PATH)
@@ -254,16 +266,13 @@ local function set_danmaku_delay(dly, time, specific_source)
         end
     end
 
+    -- 单源校准只写入该来源自己的延迟段，不能污染全局延迟状态。
     if not specific_source then
         if dly == 0 then
             DELAY = 0
         else
             DELAY = DELAY + dly
         end
-    end
-
-    if ENABLED and COMMENTS ~= nil then
-        render()
     end
 
     -- 防抖：批量重建 ASS 事件并渲染，避免频繁变更导致重复重建
@@ -275,14 +284,16 @@ local function set_danmaku_delay(dly, time, specific_source)
         if convert_danmaku_to_ass_events then
             convert_danmaku_to_ass_events(true)
         end
-        render()
+        if refresh_danmaku_renderer then
+            refresh_danmaku_renderer()
+        else
+            render()
+        end
         rebuild_convert_timer = nil
     end)
 
     if specific_source then
-        local source = DANMAKU.sources[specific_source]
-        local source_delay = get_delay_for_time(source and source.delay_segments, time or 0)
-        show_message('设置弹幕源延迟: ' .. string.format("%.1f", source_delay + 1e-10) .. ' s')
+        show_message('设置当前来源弹幕延迟: ' .. string.format("%.1f", dly + 1e-10) .. ' s')
     else
         show_message('设置弹幕延迟: ' .. string.format("%.1f", DELAY + 1e-10) .. ' s')
         mp.set_property_native(DELAY_PROPERTY, DELAY)
@@ -313,17 +324,12 @@ local function clear_source()
     msg.verbose("已重置当前视频所有弹幕源更改")
 end
 
-function write_history(episodeid, api_server)
+function write_history(episodeid, api_server, matched_episode_number)
     local history = {}
     local path = mp.get_property("path")
     local dir = get_parent_directory(path)
     local fname = mp.get_property('filename/no-ext')
-    local episodeNumber = 0
-    if episodeid then
-        episodeNumber = tonumber(episodeid) % 1000
-    elseif DANMAKU.extra then
-        episodeNumber = DANMAKU.extra.episodenum
-    end
+    local episodeNumber = tonumber(matched_episode_number)
 
     if is_protocol(path) then
         local title, season_num, episod_num = parse_title()
@@ -337,6 +343,19 @@ function write_history(episodeid, api_server)
             episodeNumber = episod_num
         end
     end
+
+    -- Third-party servers do not necessarily encode the episode number in
+    -- episodeId. Prefer explicit API metadata and the actual media filename.
+    if not episodeNumber and DANMAKU.extra then
+        episodeNumber = DANMAKU.extra.episodenum
+    end
+    if not episodeNumber and fname then
+        episodeNumber = get_episode_number(fname)
+    end
+    if not episodeNumber and episodeid then
+        episodeNumber = tonumber(episodeid) % 1000
+    end
+    episodeNumber = tonumber(episodeNumber) or 0
 
     if dir ~= nil then
         local history_json = read_file(HISTORY_PATH)
@@ -365,9 +384,7 @@ function remove_source_from_history(rm_source)
     local history_json = read_file(HISTORY_PATH)
     local path = mp.get_property("path")
 
-    if is_protocol(path) then
-        path = remove_query(path)
-    end
+    path = is_protocol(path) and remove_query(path) or path
 
     if history_json then
         local history = utils.parse_json(history_json) or {}
@@ -389,9 +406,7 @@ function add_source_to_history(add_url, add_source)
     local history_json = read_file(HISTORY_PATH)
     local path = mp.get_property("path")
 
-    if is_protocol(path) then
-        path = remove_query(path)
-    end
+    path = is_protocol(path) and remove_query(path) or path
 
     local history = {}
     if history_json then
@@ -421,9 +436,7 @@ function add_source_to_history(add_url, add_source)
 end
 
 function read_danmaku_source_record(path)
-    if is_protocol(path) then
-        path = remove_query(path)
-    end
+    path = is_protocol(path) and remove_query(path) or path
 
     local history_json = read_file(HISTORY_PATH)
     if not history_json then return end
@@ -501,48 +514,14 @@ function read_danmaku_source_record(path)
     end
 end
 
-local function get_save_danmaku_output(path, filename)
-    if not path or not filename then return nil end
-
-    local custom_dir = options.save_danmaku_path ~= "" and
-        mp.command_native({"expand-path", options.save_danmaku_path}) or nil
-    local is_url = is_protocol(path)
-    local mode = options.save_danmaku_path_mode
-    local dir = nil
-
-    if mode ~= "url" and mode ~= "all" then
-        mode = "local"
-    end
-
-    if custom_dir and (mode == "all" or (mode == "url" and is_url) or (mode == "local" and not is_url)) then
-        local output_name = sanitize_filename(filename)
-        if not is_url then
-            dir = get_parent_directory(path)
-            local _, parent_name = dir and utils.split_path(dir:sub(1, -2))
-            if parent_name and parent_name ~= "" then
-                output_name = sanitize_filename(parent_name .. "_" .. filename)
-            end
-        end
-        return utils.join_path(custom_dir, output_name .. ".xml")
-    end
-
-    if is_url then
-        return nil
-    end
-
-    dir = get_parent_directory(path)
-    if not dir then
-        return nil
-    end
-    return utils.join_path(dir, filename .. ".xml")
-end
-
 -- 视频播放时保存弹幕
 function save_danmaku(not_forced)
     local path = mp.get_property("path")
-    local filename = is_protocol(path) and mp.get_property("media-title") or mp.get_property('filename/no-ext')
-    local danmaku_out = get_save_danmaku_output(path, filename)
-    if not danmaku_out or (not file_exists(danmaku_out)
+    local dir = get_parent_directory(path) or ""
+    local filename = mp.get_property('filename/no-ext')
+    local danmaku_out = utils.join_path(dir, filename .. ".xml")
+    -- 排除网络播放场景
+    if not path or is_protocol(path) or (not file_exists(danmaku_out)
     and not is_writable(danmaku_out)) then
         show_message("此弹幕文件不支持保存至本地")
         msg.warn("此弹幕文件不支持保存至本地")
@@ -593,6 +572,15 @@ function load_danmaku_for_url(path)
     addon_danmaku()
 end
 
+local function api_server_is_configured(url)
+    if not url or url == "" then return false end
+    local target = tostring(url):gsub("/+$", "")
+    for _, configured in ipairs(get_api_server_list(options.api_server)) do
+        if tostring(configured):gsub("/+$", "") == target then return true end
+    end
+    return false
+end
+
 -- 自动加载上次匹配的弹幕
 function auto_load_danmaku(path, dir, filename, number)
     if dir ~= nil then
@@ -610,22 +598,34 @@ function auto_load_danmaku(path, dir, filename, number)
                 local history_fname = history_dir.fname
                 local history_extra = history_dir.extra
                 local history_api_server = history_dir.api_server
+                if history_api_server and not api_server_is_configured(history_api_server) then
+                    msg.warn("历史记录中的弹幕服务器已移除，改用当前配置的服务器")
+                    history_api_server = nil
+                end
                 local playing_number = nil
+
+                -- Repair old history written from episodeId % 1000. The
+                -- filename is the reliable source for SxxExx media names.
+                local parsed_history_number = history_fname and get_episode_number(history_fname)
+                if parsed_history_number then history_number = parsed_history_number end
+                history_number = tonumber(history_number)
 
                 if history_fname then
                     if filename ~= history_fname then
                         if number then
-                            playing_number = number
+                            playing_number = tonumber(number)
                         else
                             history_number, playing_number = get_episode_number(filename, history_fname)
                         end
                     else
-                        playing_number = history_number
+                        playing_number = tonumber(number) or get_episode_number(filename) or history_number
                     end
                 else
-                    playing_number = get_episode_number(filename)
+                    playing_number = tonumber(number) or get_episode_number(filename)
                 end
-                if playing_number ~= nil then
+                history_number = tonumber(history_number)
+                playing_number = tonumber(playing_number)
+                if playing_number ~= nil and history_number ~= nil then
                     local x = playing_number - history_number --获取集数差值
                     DANMAKU.episode = episode_number and string.format("第%s话", episode_number + x) or history_dir.episodeTitle
                     DANMAKU.api_server = history_api_server or nil
@@ -633,7 +633,7 @@ function auto_load_danmaku(path, dir, filename, number)
                     msg.verbose("自动加载上次匹配的弹幕")
                     if history_id then
                         local tmp_id = tostring(x + history_id)
-                        set_episode_id(tmp_id)
+                        set_episode_id(tmp_id, nil, history_api_server, playing_number)
                     elseif history_extra then
                         local episodenum = history_extra.episodenum + x
                         get_details(history_extra.class, history_extra.id, history_extra.site,
@@ -676,6 +676,7 @@ function init(path)
 end
 
 mp.register_event("file-loaded", function()
+    auto_load_generation = auto_load_generation + 1
     local path = mp.get_property("path")
     local dir = get_parent_directory(path)
     local filename = mp.get_property('filename/no-ext')
@@ -693,8 +694,10 @@ mp.register_event("file-loaded", function()
     end
 
     if options.autoload_for_url and is_protocol(path) then
-        ENABLED = true
-        load_danmaku_for_url(path)
+        delay_auto_load(function()
+            ENABLED = true
+            load_danmaku_for_url(path)
+        end)
     end
 
     if filename == nil or dir == nil then
@@ -710,14 +713,16 @@ mp.register_event("file-loaded", function()
     end
 
     if options.auto_load then
-        ENABLED = true
-        auto_load_danmaku(path, dir, filename)
-        addon_danmaku(dir, false)
+        delay_auto_load(function()
+            ENABLED = true
+            auto_load_danmaku(path, dir, filename)
+            addon_danmaku(dir, false)
+        end)
         return
     end
 
     if ENABLED and COMMENTS == nil and not is_async_running() then
-        init(path)
+        delay_auto_load(function() init(path) end)
     end
 end)
 
@@ -767,7 +772,6 @@ mp.register_script_message("show_danmaku_keyboard", function()
     end
 end)
 
-mp.register_script_message("check-update", check_for_update)
 mp.register_script_message("clear-source", clear_source)
 mp.register_script_message("immediately_save_danmaku", save_danmaku)
 mp.register_script_message("open_source_delay_menu", open_delay_menu)
